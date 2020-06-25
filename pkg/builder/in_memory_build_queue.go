@@ -34,6 +34,14 @@ import (
 var (
 	inMemoryBuildQueuePrometheusMetrics sync.Once
 
+	inMemoryBuildQueueOperationsQueuedCurrent = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "buildbarn",
+			Subsystem: "builder",
+			Name:      "in_memory_build_queue_operations_queued_current",
+			Help:      "Number of operations in the queue.",
+		},
+		[]string{"instance_name", "platform"})
 	inMemoryBuildQueueOperationsQueuedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "buildbarn",
@@ -176,6 +184,7 @@ type InMemoryBuildQueue struct {
 // execution requests. All of these are created by sending it RPCs.
 func NewInMemoryBuildQueue(contentAddressableStorage cas.ContentAddressableStorage, clock clock.Clock, uuidGenerator util.UUIDGenerator, configuration *InMemoryBuildQueueConfiguration) *InMemoryBuildQueue {
 	inMemoryBuildQueuePrometheusMetrics.Do(func() {
+		prometheus.MustRegister(inMemoryBuildQueueOperationsQueuedCurrent)
 		prometheus.MustRegister(inMemoryBuildQueueOperationsQueuedTotal)
 		prometheus.MustRegister(inMemoryBuildQueueOperationsQueuedDurationSeconds)
 		prometheus.MustRegister(inMemoryBuildQueueOperationsExecutingDurationSeconds)
@@ -322,6 +331,7 @@ func (bq *InMemoryBuildQueue) Execute(in *remoteexecution.ExecuteRequest, out re
 			operation: o,
 		})
 		pq.wakeupNextWorker()
+		pq.updateOperationsQueuedCurrent()
 		inMemoryBuildQueueOperationsQueuedTotal.WithLabelValues(platformKey.instance, platformKey.platform).Inc()
 	}
 	return o.waitExecution(bq, out)
@@ -828,6 +838,7 @@ type platformQueue struct {
 func newPlatformQueue(platformKey platformKey) *platformQueue {
 	// Force creation of all metrics associated with
 	// this platform queue to make recording rules work.
+	inMemoryBuildQueueOperationsQueuedCurrent.WithLabelValues(platformKey.instance, platformKey.platform).Set(0)
 	inMemoryBuildQueueOperationsQueuedTotal.WithLabelValues(platformKey.instance, platformKey.platform)
 	inMemoryBuildQueueOperationsQueuedDurationSeconds.WithLabelValues(platformKey.instance, platformKey.platform)
 	inMemoryBuildQueueOperationsExecutingDurationSeconds.WithLabelValues(platformKey.instance, platformKey.platform, "Success", "")
@@ -873,10 +884,16 @@ func (pq *platformQueue) workerIsDrained(workerID map[string]string) bool {
 func (pq *platformQueue) getNextOperationNonBlocking(bq *InMemoryBuildQueue, workerID map[string]string) (*operation, bool) {
 	if !pq.workerIsDrained(workerID) && pq.queuedOperations.Len() > 0 {
 		entry := heap.Pop(&pq.queuedOperations).(queuedOperationsEntry)
+		pq.updateOperationsQueuedCurrent()
 		return entry.operation, true
 	}
 	return nil, false
 }
+
+func (pq *platformQueue) updateOperationsQueuedCurrent() {
+	inMemoryBuildQueueOperationsQueuedCurrent.WithLabelValues(pq.platformKey.instance, pq.platformKey.platform).Set(len(pq.queuedOperations))
+}
+
 
 // getNextOperationBlocking extracts the next operation that should be
 // assigned to a worker. This function blocks until either the worker is
